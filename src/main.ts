@@ -65,8 +65,8 @@ async function getDiff(
 async function analyzeCode(
   parsedDiff: File[],
   prDetails: PRDetails
-): Promise<Array<{ body: string; path: string; line: number }>> {
-  const comments: Array<{ body: string; path: string; line: number }> = [];
+): Promise<Array<{ body: string; path: string; line?: number }>> {
+  const comments: Array<{ body: string; path: string; line?: number }> = [];
 
   for (const file of parsedDiff) {
     if (file.to === "/dev/null") continue; // Ignore deleted files
@@ -85,28 +85,59 @@ async function analyzeCode(
 }
 
 function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
-  return `Your task is to review pull requests. Instructions:
-- Provide the response in following JSON format: {"reviews": [{"lineNumber": <line_number>, "reviewComment": "<review comment>", "isGeneralComment": <boolean>}]}
-- Do not give positive comments or compliments.
-- For line-specific issues, provide the line number and set isGeneralComment to false.
-- For important architectural or design issues that don't map to specific lines, set isGeneralComment to true and omit the lineNumber.
-- Only use general comments for significant issues that cannot be tied to specific lines.
-- Write the comment in GitHub Markdown format.
-- Use the given description only for the overall context and only comment the code.
-- IMPORTANT: NEVER suggest adding comments to the code.
-- For line-specific comments, only comment on lines that are part of the changed code (lines starting with + or -).
+  return `You are an expert code reviewer focusing on code quality, security, and best practices. Your task is to review the following pull request changes.
 
-Review the following code diff in the file "${file.to}" and take the pull request title and description into account when writing the response.
-  
-Pull request title: ${prDetails.title}
-Pull request description:
+RESPONSE FORMAT:
+You must respond with a JSON object in this exact format:
+{
+  "reviews": [
+    {
+      "lineNumber": <number or null>,
+      "reviewComment": "<your detailed review comment>",
+      "isGeneralComment": <boolean>
+    }
+  ]
+}
 
+REVIEW GUIDELINES:
+1. Focus Areas:
+   - Code quality and maintainability
+   - Potential bugs or edge cases
+   - Security vulnerabilities
+   - Performance implications
+   - Architecture and design patterns
+
+2. Comment Types:
+   - For issues tied to specific lines:
+     * Set "lineNumber" to the line number
+     * Set "isGeneralComment" to false
+   - For broader architectural or design issues:
+     * Omit "lineNumber" or set to null
+     * Set "isGeneralComment" to true
+     * Use only for significant issues that affect multiple lines or overall design
+
+3. Writing Style:
+   - Be concise but thorough
+   - Use Markdown formatting for clarity
+   - Explain both the problem and the recommended solution
+   - Include examples when helpful
+   - Be direct but constructive
+
+4. Restrictions:
+   - Never suggest adding code comments
+   - Never provide positive feedback or compliments
+   - For line-specific comments, only reference lines that start with + or -
+   - Only raise issues that need improvement
+
+CONTEXT:
+File: ${file.to}
+PR Title: ${prDetails.title}
+PR Description:
 ---
 ${prDetails.description}
 ---
 
-Git diff to review:
-
+DIFF TO REVIEW:
 \`\`\`diff
 ${chunk.content}
 ${chunk.changes
@@ -114,7 +145,8 @@ ${chunk.changes
   .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
   .join("\n")}
 \`\`\`
-`;
+
+Analyze the code changes and provide your review following the above guidelines.`;
 }
 
 async function getAIResponse(prompt: string): Promise<Array<AIResponse> | null> {
@@ -198,22 +230,21 @@ async function createReviewComment(
   pull_number: number,
   comments: Array<{ body: string; path: string; line?: number }>
 ): Promise<void> {
-  // Separate line-specific comments and general comments
-  const lineComments = comments.filter(c => c.line !== undefined);
+  const lineComments = comments.filter((c): c is { body: string; path: string; line: number } => 
+    c.line !== undefined
+  );
   const generalComments = comments.filter(c => c.line === undefined);
 
-  // Create line-specific review comments
   if (lineComments.length > 0) {
     await octokit.pulls.createReview({
       owner,
       repo,
       pull_number,
-      comments: lineComments as Array<{ body: string; path: string; line: number }>,
+      comments: lineComments,
       event: "COMMENT",
     });
   }
 
-  // Add general comments to the PR description
   if (generalComments.length > 0) {
     const generalCommentsBody = generalComments
       .map(c => c.body)
