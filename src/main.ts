@@ -128,6 +128,8 @@ REVIEW GUIDELINES:
    - Never provide positive feedback or compliments
    - For line-specific comments, only reference lines that start with + or -
    - Only raise issues that need improvement
+   - Be VERY concise, specific, and actionable
+   - Only provide the most critical feedback. Do not nitpick.
 
 CONTEXT:
 File: ${file.to}
