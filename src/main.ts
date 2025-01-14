@@ -23,6 +23,12 @@ interface PRDetails {
   description: string;
 }
 
+interface AIResponse {
+  lineNumber: string;
+  reviewComment: string;
+  isGeneralComment?: boolean;
+}
+
 async function getPRDetails(): Promise<PRDetails> {
   const { repository, number } = JSON.parse(
     readFileSync(process.env.GITHUB_EVENT_PATH || "", "utf8")
@@ -59,8 +65,8 @@ async function getDiff(
 async function analyzeCode(
   parsedDiff: File[],
   prDetails: PRDetails
-): Promise<Array<{ body: string; path: string; line: number }>> {
-  const comments: Array<{ body: string; path: string; line: number }> = [];
+): Promise<Array<{ body: string; path: string; line?: number }>> {
+  const comments: Array<{ body: string; path: string; line?: number }> = [];
 
   for (const file of parsedDiff) {
     if (file.to === "/dev/null") continue; // Ignore deleted files
@@ -79,26 +85,61 @@ async function analyzeCode(
 }
 
 function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
-  return `Your task is to review pull requests. Instructions:
-- Provide the response in following JSON format:  {"reviews": [{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}]}
-- Do not give positive comments or compliments.
-- Provide comments and suggestions ONLY if there is something to improve, otherwise "reviews" should be an empty array.
-- Write the comment in GitHub Markdown format.
-- Use the given description only for the overall context and only comment the code.
-- IMPORTANT: NEVER suggest adding comments to the code.
-- IMPORTANT: Only comment on lines that are part of the changed code (lines starting with + or -).
+  return `You are an expert code reviewer focusing on code quality, security, and best practices. Your task is to review the following pull request changes.
 
-Review the following code diff in the file "${file.to}" and take the pull request title and description into account when writing the response.
-  
-Pull request title: ${prDetails.title}
-Pull request description:
+RESPONSE FORMAT:
+You must respond with a JSON object in this exact format:
+{
+  "reviews": [
+    {
+      "lineNumber": <number or null>,
+      "reviewComment": "<your detailed review comment>",
+      "isGeneralComment": <boolean>
+    }
+  ]
+}
 
+REVIEW GUIDELINES:
+1. Focus Areas:
+   - Code quality and maintainability
+   - Potential bugs or edge cases
+   - Security vulnerabilities
+   - Performance implications
+   - Architecture and design patterns
+
+2. Comment Types:
+   - For issues tied to specific lines:
+     * Set "lineNumber" to the line number
+     * Set "isGeneralComment" to false
+   - For broader architectural or design issues:
+     * Omit "lineNumber" or set to null
+     * Set "isGeneralComment" to true
+     * Use only for significant issues that affect multiple lines or overall design
+
+3. Writing Style:
+   - Be concise but thorough
+   - Use Markdown formatting for clarity
+   - Explain both the problem and the recommended solution
+   - Include examples when helpful
+   - Be direct but constructive
+
+4. Restrictions:
+   - Never suggest adding code comments
+   - Never provide positive feedback or compliments
+   - For line-specific comments, only reference lines that start with + or -
+   - Only raise issues that need improvement
+   - Be VERY concise, specific, and actionable
+   - Only provide the most critical feedback. Do not nitpick.
+
+CONTEXT:
+File: ${file.to}
+PR Title: ${prDetails.title}
+PR Description:
 ---
 ${prDetails.description}
 ---
 
-Git diff to review:
-
+DIFF TO REVIEW:
 \`\`\`diff
 ${chunk.content}
 ${chunk.changes
@@ -106,13 +147,11 @@ ${chunk.changes
   .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
   .join("\n")}
 \`\`\`
-`;
+
+Analyze the code changes and provide your review following the above guidelines.`;
 }
 
-async function getAIResponse(prompt: string): Promise<Array<{
-  lineNumber: string;
-  reviewComment: string;
-}> | null> {
+async function getAIResponse(prompt: string): Promise<Array<AIResponse> | null> {
   const queryConfig = {
     model: OPENAI_API_MODEL,
     temperature: 0.2,
@@ -148,14 +187,21 @@ async function getAIResponse(prompt: string): Promise<Array<{
 function createComment(
   file: File,
   chunk: Chunk,
-  aiResponses: Array<{
-    lineNumber: string;
-    reviewComment: string;
-  }>
-): Array<{ body: string; path: string; line: number }> {
+  aiResponses: Array<AIResponse>
+): Array<{ body: string; path: string; line?: number }> {
   return aiResponses.flatMap((aiResponse) => {
     if (!file.to) {
       return [];
+    }
+
+    const signature = `\n\n<sub>Reviewed by AI (${OPENAI_API_MODEL})</sub>`;
+
+    // Handle general comments
+    if (aiResponse.isGeneralComment) {
+      return [{
+        body: `**General comment for ${file.to}:**\n\n${aiResponse.reviewComment}${signature}`,
+        path: file.to
+      }];
     }
 
     // Convert lineNumber to number
@@ -164,9 +210,9 @@ function createComment(
     // Verify the line number is within the current chunk
     const isLineInChunk = chunk.changes.some(
       (change) => 
-        // Check both new and old line numbers
-        (change.ln && change.ln === lineNum) || 
-        (change.ln2 && change.ln2 === lineNum)
+        // Check both new and old line numbers using type assertion
+        ((change as any).ln && (change as any).ln === lineNum) || 
+        ((change as any).ln2 && (change as any).ln2 === lineNum)
     );
 
     if (!isLineInChunk) {
@@ -174,11 +220,11 @@ function createComment(
       return [];
     }
 
-    return {
-      body: aiResponse.reviewComment,
+    return [{
+      body: `${aiResponse.reviewComment}${signature}`,
       path: file.to,
       line: lineNum,
-    };
+    }];
   });
 }
 
@@ -186,15 +232,36 @@ async function createReviewComment(
   owner: string,
   repo: string,
   pull_number: number,
-  comments: Array<{ body: string; path: string; line: number }>
+  comments: Array<{ body: string; path: string; line?: number }>
 ): Promise<void> {
-  await octokit.pulls.createReview({
-    owner,
-    repo,
-    pull_number,
-    comments,
-    event: "COMMENT",
-  });
+  const lineComments = comments.filter((c): c is { body: string; path: string; line: number } => 
+    c.line !== undefined
+  );
+  const generalComments = comments.filter(c => c.line === undefined);
+
+  if (lineComments.length > 0) {
+    await octokit.pulls.createReview({
+      owner,
+      repo,
+      pull_number,
+      comments: lineComments,
+      event: "COMMENT",
+    });
+  }
+
+  if (generalComments.length > 0) {
+    const generalCommentsBody = generalComments
+      .map(c => c.body)
+      .join('\n\n---\n\n');
+
+    await octokit.pulls.createReview({
+      owner,
+      repo,
+      pull_number,
+      body: `# AI Code Review - General Comments\n\n${generalCommentsBody}\n\n<sub>Reviewed by AI (${OPENAI_API_MODEL})</sub>`,
+      event: "COMMENT",
+    });
+  }
 }
 
 async function main() {
