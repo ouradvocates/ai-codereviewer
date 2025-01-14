@@ -194,10 +194,12 @@ function createComment(
       return [];
     }
 
+    const signature = `\n\n<sub>Reviewed by AI (${OPENAI_API_MODEL})</sub>`;
+
     // Handle general comments
     if (aiResponse.isGeneralComment) {
       return [{
-        body: `**General comment for ${file.to}:**\n\n${aiResponse.reviewComment}`,
+        body: `**General comment for ${file.to}:**\n\n${aiResponse.reviewComment}${signature}`,
         path: file.to
       }];
     }
@@ -219,7 +221,7 @@ function createComment(
     }
 
     return [{
-      body: aiResponse.reviewComment,
+      body: `${aiResponse.reviewComment}${signature}`,
       path: file.to,
       line: lineNum,
     }];
@@ -256,7 +258,7 @@ async function createReviewComment(
       owner,
       repo,
       pull_number,
-      body: `# AI Code Review - General Comments\n\n${generalCommentsBody}`,
+      body: `# AI Code Review - General Comments\n\n${generalCommentsBody}\n\n<sub>Reviewed by AI (${OPENAI_API_MODEL})</sub>`,
       event: "COMMENT",
     });
   }
